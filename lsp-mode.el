@@ -41,7 +41,6 @@
 (require 'inline)
 (require 'json)
 (require 'lv)
-(require 'markdown-mode)
 (require 'network-stream)
 (require 'pcase)
 (require 'rx)
@@ -69,6 +68,23 @@
 (declare-function yas-expand-snippet "ext:yasnippet")
 (declare-function dap-mode "ext:dap-mode")
 (declare-function dap-auto-configure-mode "ext:dap-mode")
+
+;; `markdown-mode' stays a hard dependency (it is the fallback renderer and
+;; is widely pulled in by other packages anyway), but it is now loaded
+;; lazily — only when the `markdown-mode' engine is actually used.  When the
+;; stock tree-sitter `markdown-ts-view-mode' is available it is preferred and
+;; `markdown-mode' is never loaded.  See `lsp-markdown-render-engine'.
+(declare-function gfm-view-mode "ext:markdown-mode")
+(declare-function gfm-mode "ext:markdown-mode")
+(declare-function markdown-find-next-prop "ext:markdown-mode")
+(declare-function markdown-link-at-pos "ext:markdown-mode")
+(declare-function markdown-ts-view-mode "textmodes/markdown-ts-mode")
+(defvar markdown-code-lang-modes)
+(defvar markdown-fontify-code-blocks-natively)
+(defvar markdown-fontify-code-block-default-mode)
+(defvar markdown-hide-markup)
+(defvar markdown-enable-math)
+(defvar markdown-ts-code-block-modes)
 
 (defvar yas-inhibit-overlay-modification-protection)
 (defvar yas-indent-line)
@@ -1182,7 +1198,54 @@ Set to nil to disable the warning."
 (defvar lsp-custom-markup-modes
   '((rust-mode "no_run" "rust,no_run" "rust,ignore" "rust,should_panic"))
   "Mode to uses with markdown code blocks.
-They are added to `markdown-code-lang-modes'")
+They are added to `markdown-code-lang-modes' (for the `markdown-mode'
+engine) or to `markdown-ts-code-block-modes' (for the `markdown-ts'
+engine).  See `lsp-markdown-render-engine'.")
+
+(defcustom lsp-markdown-render-engine 'auto
+  "Major mode used to fontify markdown documentation (hover, signature).
+
+Possible values:
+
+- `auto' : Prefer the tree-sitter `markdown-ts-view-mode' when it is
+  available (stock in Emacs 31.1+) and the `markdown' grammar is
+  installed, otherwise gracefully fall back to `markdown-mode' if it is
+  installed, otherwise render as plain text.  No errors are signalled.
+
+- `markdown-ts' : force `markdown-ts-view-mode'.  Requires the `markdown'
+  tree-sitter grammar and an Emacs that ships the mode; if either is
+  missing an error is signalled (no fallback).
+
+- `markdown-mode' : force the third-party `markdown-mode'/`gfm-view-mode'.
+  It remains a hard dependency of `lsp-mode' (the fallback renderer), but
+  is loaded lazily, only when this engine is used."
+  :type '(choice (const :tag "Automatic (prefer markdown-ts, fall back to markdown-mode)" auto)
+                 (const :tag "Force tree-sitter (markdown-ts-view-mode)" markdown-ts)
+                 (const :tag "Force markdown-mode / gfm-view-mode" markdown-mode))
+  :group 'lsp-mode
+  :package-version '(lsp-mode . "10.0.1"))
+
+(defun lsp--markdown-render-engine ()
+  "Resolve `lsp-markdown-render-engine' to a concrete engine.
+Return `markdown-ts' or `markdown-mode' when a renderer is selected, or
+nil when none is available (in which case markup is shown verbatim).
+
+When the user forces an engine explicitly, it is returned as-is and no
+graceful degradation happens; the caller is responsible for signalling an
+error if that engine cannot be fulfilled."
+  (pcase lsp-markdown-render-engine
+    ('markdown-ts 'markdown-ts)
+    ('markdown-mode 'markdown-mode)
+    ;; `auto': pick the best available renderer, degrading gracefully to
+    ;; nil (no renderer) when neither is usable.
+    ('auto (cond ((and (fboundp 'markdown-ts-view-mode)
+                       (treesit-ready-p 'markdown t))
+                  'markdown-ts)
+                 ((or (fboundp 'markdown-mode)
+                      (locate-library "markdown-mode"))
+                  'markdown-mode)
+                 (t nil)))
+    (engine (error "Unknown `lsp-markdown-render-engine': %S" engine))))
 
 (defcustom lsp-signature-render-documentation t
   "Display signature documentation in `eldoc'."
@@ -2558,13 +2621,13 @@ WORKSPACE is the workspace that contains the diagnostics."
                                 :end (ht-get line-col-to-point-map
                                              (cons end-line end-character?))
                                 :kind kind?))
-                             it)
-                    (seq-filter (lambda (folding-range)
-                                  (< (lsp--folding-range-beg folding-range)
-                                     (lsp--folding-range-end folding-range)))
                                 it)
-                    (seq-into it 'list)
-                    (delete-dups it))))))
+                       (seq-filter (lambda (folding-range)
+                                     (< (lsp--folding-range-beg folding-range)
+                                        (lsp--folding-range-end folding-range)))
+                                   it)
+                       (seq-into it 'list)
+                       (delete-dups it))))))
   (cdr lsp--cached-folding-ranges))
 
 (defun lsp--get-nested-folding-ranges ()
@@ -3811,7 +3874,7 @@ disappearing, unset all the variables related to it."
     (mapc (lambda (buf)
             (when (lsp-buffer-live-p buf)
               (lsp-with-current-buffer buf
-                                       (lsp-managed-mode -1))))
+                (lsp-managed-mode -1))))
           buffers)
     (lsp-diagnostics--workspace-cleanup lsp--cur-workspace)))
 
@@ -5719,6 +5782,39 @@ MODE is the mode used in the parent frame."
         (lambda (_start _end _match) t))
   (prettify-symbols-mode 1))
 
+(defun lsp--setup-markdown-ts (mode)
+  "Set up `markdown-ts-view-mode' for fontifying documentation.
+MODE is the major mode of the buffer requesting the documentation.
+
+Signal an error when the `markdown' tree-sitter grammar is not
+available, as `markdown-ts-view-mode' would otherwise silently fall back
+to `text-mode'."
+  (unless (and (fboundp 'markdown-ts-view-mode)
+               (treesit-ready-p 'markdown t))
+    (error "lsp-mode: cannot render markdown with `markdown-ts': the \
+`markdown' tree-sitter grammar is unavailable (install it with \
+`markdown-ts-mode-install-parsers'), or set `lsp-markdown-render-engine' \
+to `markdown-mode'"))
+  ;; `markdown-ts-view-mode' is read-only, hides markup, and fontifies
+  ;; code blocks natively; entering it resets buffer-local state, so the
+  ;; code-block language mapping is installed afterwards.
+  (markdown-ts-view-mode)
+  (make-local-variable 'markdown-ts-code-block-modes)
+  (dolist (mark (alist-get mode lsp-custom-markup-modes))
+    (setf (alist-get (intern mark) markdown-ts-code-block-modes)
+          (list mode))))
+
+(defun lsp--markdown-ts-flatten-overlays ()
+  "Convert `markdown-ts' overlay faces into text properties.
+`markdown-ts-view-mode' applies some faces (e.g. code-block
+backgrounds) via overlays, which `buffer-substring' — used by
+`lsp--buffer-string-visible' — does not capture."
+  (let ((inhibit-read-only t))
+    (dolist (ov (overlays-in (point-min) (point-max)))
+      (when-let* ((face (overlay-get ov 'face)))
+        (font-lock-append-text-property
+         (overlay-start ov) (overlay-end ov) 'face face)))))
+
 (defvar lsp-help-link-keymap
   (let ((map (make-sparse-keymap)))
     (define-key map [mouse-2] #'lsp--help-open-link)
@@ -5783,13 +5879,22 @@ See #2588")
             nil t)
       (replace-match (rx (backref 1))))
 
-    ;; markdown-mode v2.3 does not yet provide gfm-view-mode
-    (if (fboundp 'gfm-view-mode)
-        (let ((view-inhibit-help-message t))
-          (gfm-view-mode))
-      (gfm-mode))
+    (pcase (lsp--markdown-render-engine)
+      ('markdown-ts
+       (lsp--setup-markdown-ts lsp-buffer-major-mode))
+      ('markdown-mode
+       (require 'markdown-mode)
+       ;; markdown-mode v2.3 does not yet provide gfm-view-mode
+       (if (fboundp 'gfm-view-mode)
+           (let ((view-inhibit-help-message t))
+             (gfm-view-mode))
+         (gfm-mode))
 
-    (lsp--setup-markdown lsp-buffer-major-mode)))
+       (lsp--setup-markdown lsp-buffer-major-mode))
+      ;; No markdown renderer available: leave the (unescaped) markup as
+      ;; plain text, mirroring historical behaviour when `markdown-mode'
+      ;; was not loaded.
+      ('nil nil))))
 
 (defvar lsp--display-inline-image-alist
   '((lsp--render-markdown
@@ -5874,12 +5979,19 @@ In addition, each can have property:
           (ignore-errors (font-lock-ensure))
           (lsp--display-inline-image mode)
           (when (eq mode 'lsp--render-markdown)
-            (lsp--fix-markdown-links))))
+            (pcase (lsp--markdown-render-engine)
+              ;; `markdown-ts' link buttons are plain text-property buttons
+              ;; (see `markdown-ts--make-link-button'), so they survive into
+              ;; the returned string and need no extra wiring; only overlay
+              ;; faces (e.g. code-block backgrounds) must be flattened.
+              ('markdown-ts (lsp--markdown-ts-flatten-overlays))
+              ('markdown-mode (lsp--fix-markdown-links))))))
       (lsp--buffer-string-visible))))
 
 (defun lsp--render-string (str language)
   "Render STR using `major-mode' corresponding to LANGUAGE.
-When language is nil render as markup if `markdown-mode' is loaded."
+Markdown is rendered with the engine selected by
+`lsp-markdown-render-engine'."
   (setq str (s-replace "\r" "" (or str "")))
   (if-let* ((modes (-keep (-lambda ((mode . lang))
                             (when (and (equal lang language) (functionp mode))
